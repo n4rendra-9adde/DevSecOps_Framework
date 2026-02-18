@@ -127,7 +127,11 @@ DETECTEOF
                         }
                         
                         if (env.DETECTED != "true") {
-                            error "❌ Could not detect project language. Repository must contain: pom.xml, package.json, requirements.txt, go.mod, or Cargo.toml"
+                            echo "⚠️ Could not detect standard project language"
+                            echo "Running minimal security scan only (secret detection)"
+                            env.LANGUAGE = "unknown"
+                            env.BUILD_TOOL = "none"
+                            env.PACKAGE_TYPE = "none"
                         }
                         
                         echo "✅ Detected: ${env.LANGUAGE} / ${env.BUILD_TOOL} / ${env.PACKAGE_TYPE}"

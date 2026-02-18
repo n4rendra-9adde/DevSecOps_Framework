@@ -1,71 +1,82 @@
 #!/bin/bash
-# detect-language.sh - Universal DevSecOps Pipeline Language Detector
-# Detects project language, build tool, and package type based on file presence.
+# detect-language.sh - Enhanced with fallback detection
 
-set -e
+echo "🔍 Scanning for project files..."
 
-# Function to write output to a file if needed, or just stdout
-# Usage: write_output "KEY" "VALUE"
-write_output() {
-    local key="$1"
-    local value="$2"
-    echo "${key}=${value}"
-}
-
-detect_language() {
-    local detected=false
-
-    # JAVA Detection
-    if [ -f "pom.xml" ]; then
-        write_output "LANGUAGE" "java"
-        write_output "BUILD_TOOL" "maven"
-        write_output "PACKAGE_TYPE" "jar"
-        detected=true
-    elif [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
-        write_output "LANGUAGE" "java"
-        write_output "BUILD_TOOL" "gradle"
-        write_output "PACKAGE_TYPE" "jar"
-        detected=true
+# Check at root level first
+if [ -f "pom.xml" ]; then 
+    echo "LANGUAGE=java"
+    echo "BUILD_TOOL=maven"
+    echo "PACKAGE_TYPE=jar"
     
-    # NODE.JS Detection
-    elif [ -f "package.json" ]; then
-        write_output "LANGUAGE" "nodejs"
-        write_output "BUILD_TOOL" "npm"
-        write_output "PACKAGE_TYPE" "docker"
-        detected=true
-        
-    # PYTHON Detection
-    elif [ -f "requirements.txt" ] || [ -f "Pipfile" ] || [ -f "pyproject.toml" ]; then
-        write_output "LANGUAGE" "python"
-        write_output "BUILD_TOOL" "pip"
-        write_output "PACKAGE_TYPE" "docker"
-        detected=true
+elif [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then 
+    echo "LANGUAGE=java"
+    echo "BUILD_TOOL=gradle"
+    echo "PACKAGE_TYPE=jar"
+    
+elif [ -f "package.json" ]; then 
+    echo "LANGUAGE=nodejs"
+    echo "BUILD_TOOL=npm"
+    echo "PACKAGE_TYPE=docker"
+    
+elif [ -f "requirements.txt" ] || [ -f "setup.py" ] || [ -f "pyproject.toml" ]; then 
+    echo "LANGUAGE=python"
+    echo "BUILD_TOOL=pip"
+    echo "PACKAGE_TYPE=docker"
+    
+elif [ -f "go.mod" ]; then 
+    echo "LANGUAGE=golang"
+    echo "BUILD_TOOL=go"
+    echo "PACKAGE_TYPE=binary"
+    
+elif [ -f "Cargo.toml" ]; then 
+    echo "LANGUAGE=rust"
+    echo "BUILD_TOOL=cargo"
+    echo "PACKAGE_TYPE=binary"
+    
+# Check subdirectories (for monorepos or nested projects)
+elif find . -maxdepth 2 -name "pom.xml" | grep -q .; then
+    echo "LANGUAGE=java"
+    echo "BUILD_TOOL=maven"
+    echo "PACKAGE_TYPE=jar"
+    echo "NOTE=Found pom.xml in subdirectory"
+    
+elif find . -maxdepth 2 -name "package.json" | grep -q .; then
+    echo "LANGUAGE=nodejs"
+    echo "BUILD_TOOL=npm"
+    echo "PACKAGE_TYPE=docker"
+    echo "NOTE=Found package.json in subdirectory"
+    
+# Docker-only projects
+elif [ -f "Dockerfile" ] || [ -f "docker-compose.yml" ]; then
+    echo "LANGUAGE=docker"
+    echo "BUILD_TOOL=docker"
+    echo "PACKAGE_TYPE=docker"
+    echo "NOTE=Docker-only project, no build tool detected"
+    
+# Static/HTML projects
+elif find . -maxdepth 1 -name "*.html" | grep -q .; then
+    echo "LANGUAGE=static"
+    echo "BUILD_TOOL=none"
+    echo "PACKAGE_TYPE=static"
+    echo "NOTE=Static HTML project"
+    
+# Shell scripts
+elif find . -maxdepth 1 -name "*.sh" | grep -q .; then
+    echo "LANGUAGE=bash"
+    echo "BUILD_TOOL=none"
+    echo "PACKAGE_TYPE=script"
+    echo "NOTE=Bash script project"
+    
+else 
+    echo "LANGUAGE=unknown"
+    echo "BUILD_TOOL=unknown"
+    echo "PACKAGE_TYPE=unknown"
+    echo "DETECTED=false"
+    echo "ERROR=No recognizable project files found"
+    echo "FILES_FOUND=$(find . -maxdepth 2 -type f -name '*.json' -o -name '*.xml' -o -name '*.yml' -o -name '*.yaml' -o -name 'Dockerfile' -o -name '*.md' | head -10 | tr '\n' ' ')"
+    exit 1
+fi
 
-    # GOLANG Detection
-    elif [ -f "go.mod" ]; then
-        write_output "LANGUAGE" "golang"
-        write_output "BUILD_TOOL" "go"
-        write_output "PACKAGE_TYPE" "binary"
-        detected=true
-
-    # RUST Detection
-    elif [ -f "Cargo.toml" ]; then
-        write_output "LANGUAGE" "rust"
-        write_output "BUILD_TOOL" "cargo"
-        write_output "PACKAGE_TYPE" "binary"
-        detected=true
-    fi
-
-    if [ "$detected" = true ]; then
-        write_output "DETECTED" "true"
-        echo "TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        exit 0
-    else
-        echo "LANGUAGE=unknown"
-        echo "ERROR=No recognizable project files found"
-        exit 1
-    fi
-}
-
-# Run detection
-detect_language
+echo "DETECTED=true"
+echo "TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
