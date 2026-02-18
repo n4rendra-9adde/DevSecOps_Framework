@@ -284,7 +284,7 @@ DETECTEOF
                                                     --scan . \
                                                     --format JSON --format HTML \
                                                     --out ${REPORT_DIR}/dependency-check \
-                                                    --enableExperimental 2>/dev/null || true
+                                                    --enableExperimental --noupdate 2>/dev/null || true
                                             else
                                                 echo "⚠️ Dependency-Check not installed"
                                             fi
@@ -321,29 +321,32 @@ DETECTEOF
                         
                         def imageName = "app-${env.BUILD_NUMBER}:latest"
                         
-                        sh """
-                            if [ -f Dockerfile ]; then
-                                docker build -t ${imageName} . 2>/dev/null || echo "Docker build failed"
-                            else
-                                echo "No Dockerfile, creating minimal..."
-                                cat > Dockerfile << 'DOCKEREOF'
-FROM eclipse-temurin:17-jre-alpine
+                        // Build Docker image with proper error handling
+                        def buildResult = 1
+                        if (fileExists('Dockerfile')) {
+                            buildResult = sh(script: "docker build -t ${imageName} .", returnStatus: true)
+                        } else {
+                            echo "No Dockerfile, creating minimal..."
+                            writeFile file: 'Dockerfile', text: '''FROM eclipse-temurin:17-jre-alpine
 WORKDIR /app
-COPY target/*.jar app.jar 2>/dev/null || COPY build/libs/*.jar app.jar 2>/dev/null || true
+COPY target/*.jar app.jar
 ENTRYPOINT ["java","-jar","app.jar"]
-DOCKEREOF
-                                docker build -t ${imageName} . 2>/dev/null || echo "Docker build failed"
-                            fi
-                        """
+'''
+                            buildResult = sh(script: "docker build -t ${imageName} .", returnStatus: true)
+                        }
                         
-                        sh """
-                            if command -v trivy &> /dev/null && docker images | grep -q ${imageName}; then
-                                trivy image --format json --output ${REPORT_DIR}/trivy.json --severity HIGH,CRITICAL ${imageName} 2>/dev/null || true
-                                trivy image --format table --output ${REPORT_DIR}/trivy.txt --severity HIGH,CRITICAL ${imageName} 2>/dev/null || true
-                            else
-                                echo "⚠️ Trivy or Docker image not available"
-                            fi
-                        """
+                        if (buildResult != 0) {
+                            echo "⚠️ Docker build failed (exit ${buildResult}), skipping container scan"
+                            currentBuild.result = 'UNSTABLE'
+                        } else {
+                            // Only scan if build succeeded
+                            if (sh(script: 'command -v trivy', returnStatus: true) == 0) {
+                                sh "trivy image --format json --output ${REPORT_DIR}/trivy.json --severity HIGH,CRITICAL ${imageName} || true"
+                                sh "trivy image --format table --output ${REPORT_DIR}/trivy.txt --severity HIGH,CRITICAL ${imageName} || true"
+                            } else {
+                                echo "⚠️ Trivy not installed, skipping container scan"
+                            }
+                        }
                     }
                 }
             }
@@ -354,36 +357,84 @@ DOCKEREOF
                 script {
                     echo "📊 Generating unified security report"
                     
-                    // Manual JSON parsing (no readJSON plugin needed)
-                    def secretsFound = 0
-                    def sastFindings = 0
-                    def scaVulns = 0
+                    // Status-aware metrics (show real state, not misleading 0)
+                    def secretsFound = 'N/A'
+                    def secretsStatus = 'NOT RUN'
+                    def sastFindings = 'N/A'
+                    def sastStatus = 'NOT RUN'
+                    def scaVulns = 'N/A'
+                    def scaStatus = 'NOT RUN'
+                    def containerStatus = 'NOT RUN'
                     
-                    // Parse Gitleaks JSON manually
+                    // Parse Gitleaks JSON
                     if (fileExists("${REPORT_DIR}/gitleaks.json")) {
                         try {
                             def gitleaksText = readFile("${REPORT_DIR}/gitleaks.json")
                             if (gitleaksText.trim()) {
                                 def gitleaksJson = new groovy.json.JsonSlurper().parseText(gitleaksText)
                                 secretsFound = gitleaksJson instanceof List ? gitleaksJson.size() : 0
+                                secretsStatus = 'COMPLETED'
                             }
                         } catch (Exception e) {
+                            secretsFound = 'ERROR'
+                            secretsStatus = 'FAILED'
                             echo "⚠️ Could not parse gitleaks.json: ${e.message}"
                         }
                     }
                     
-                    // Parse Semgrep JSON manually
+                    // Parse Semgrep JSON
                     if (fileExists("${REPORT_DIR}/semgrep.json")) {
                         try {
                             def semgrepText = readFile("${REPORT_DIR}/semgrep.json")
                             if (semgrepText.trim()) {
                                 def semgrepJson = new groovy.json.JsonSlurper().parseText(semgrepText)
                                 sastFindings = semgrepJson.results?.size() ?: 0
+                                sastStatus = 'COMPLETED'
                             }
                         } catch (Exception e) {
+                            sastFindings = 'ERROR'
+                            sastStatus = 'FAILED'
                             echo "⚠️ Could not parse semgrep.json: ${e.message}"
                         }
                     }
+                    
+                    // Check Dependency-Check / npm audit / safety
+                    if (fileExists("${REPORT_DIR}/dependency-check/dependency-check-report.json")) {
+                        try {
+                            def dcText = readFile("${REPORT_DIR}/dependency-check/dependency-check-report.json")
+                            def dcJson = new groovy.json.JsonSlurper().parseText(dcText)
+                            scaVulns = dcJson.dependencies?.collect { it.vulnerabilities?.size() ?: 0 }?.sum() ?: 0
+                            scaStatus = 'COMPLETED'
+                        } catch (Exception e) {
+                            scaVulns = 'ERROR'
+                            scaStatus = 'FAILED'
+                        }
+                    } else if (fileExists("${REPORT_DIR}/npm-audit.json")) {
+                        try {
+                            def npmText = readFile("${REPORT_DIR}/npm-audit.json")
+                            def npmJson = new groovy.json.JsonSlurper().parseText(npmText)
+                            scaVulns = npmJson.metadata?.vulnerabilities?.values()?.sum() ?: 0
+                            scaStatus = 'COMPLETED'
+                        } catch (Exception e) {
+                            scaVulns = 'ERROR'
+                            scaStatus = 'FAILED'
+                        }
+                    } else {
+                        scaVulns = 'SKIPPED'
+                        scaStatus = 'SKIPPED'
+                    }
+                    
+                    // Check container scan
+                    if (fileExists("${REPORT_DIR}/trivy.json")) {
+                        containerStatus = 'COMPLETED'
+                    } else if (currentBuild.result == 'UNSTABLE') {
+                        containerStatus = 'DOCKER BUILD FAILED'
+                    }
+                    
+                    // Helper closures for CSS classes
+                    def metricClass = { val -> val in ['ERROR', 'SKIPPED', 'N/A'] || (val instanceof Integer && val > 0) ? 'danger' : '' }
+                    def cardClass = { status -> status == 'COMPLETED' ? 'success' : 'warning' }
+                    def stageIcon = { status -> status == 'COMPLETED' ? '✅' : '⚠️' }
                     
                     // Generate HTML report
                     writeFile file: "${REPORT_DIR}/security-report.html", text: """<!DOCTYPE html>
@@ -402,9 +453,12 @@ DOCKEREOF
         .metric { font-size: 36px; font-weight: bold; color: #16c79a; }
         .metric.danger { color: #e94560; }
         .label { color: #a0a0a0; font-size: 14px; text-transform: uppercase; }
+        .status { font-size: 12px; margin-top: 8px; }
+        .status-pass { color: #16c79a; }
+        .status-fail { color: #e94560; }
+        .status-warn { color: #f9a825; }
         .stage-list { background: #16213e; padding: 20px; border-radius: 10px; }
         .stage-item { padding: 10px; border-bottom: 1px solid #0f3460; }
-        .stage-item::before { content: "✅ "; color: #16c79a; }
     </style>
 </head>
 <body>
@@ -418,30 +472,40 @@ DOCKEREOF
     </div>
     
     <div class="grid">
-        <div class="card ${secretsFound > 0 ? 'warning' : 'success'}">
-            <div class="metric ${secretsFound > 0 ? 'danger' : ''}">${secretsFound}</div>
+        <div class="card ${cardClass(secretsStatus)}">
+            <div class="metric ${metricClass(secretsFound)}">${secretsFound}</div>
             <div class="label">Secrets Found</div>
+            <div class="status ${secretsStatus == 'COMPLETED' ? 'status-pass' : 'status-fail'}">
+                ${stageIcon(secretsStatus)} ${secretsStatus}
+            </div>
         </div>
-        <div class="card ${sastFindings > 0 ? 'warning' : 'success'}">
-            <div class="metric ${sastFindings > 10 ? 'danger' : ''}">${sastFindings}</div>
+        <div class="card ${cardClass(sastStatus)}">
+            <div class="metric ${metricClass(sastFindings)}">${sastFindings}</div>
             <div class="label">SAST Findings</div>
+            <div class="status ${sastStatus == 'COMPLETED' ? 'status-pass' : 'status-fail'}">
+                ${stageIcon(sastStatus)} ${sastStatus}
+            </div>
         </div>
-        <div class="card ${scaVulns > 0 ? 'warning' : 'success'}">
-            <div class="metric ${scaVulns > 5 ? 'danger' : ''}">${scaVulns}</div>
+        <div class="card ${cardClass(scaStatus)}">
+            <div class="metric ${metricClass(scaVulns)}">${scaVulns}</div>
             <div class="label">SCA Vulnerabilities</div>
+            <div class="status ${scaStatus == 'COMPLETED' ? 'status-pass' : 'status-fail'}">
+                ${stageIcon(scaStatus)} ${scaStatus}
+            </div>
         </div>
     </div>
     
     <div class="stage-list" style="margin-top: 30px;">
         <h3>Pipeline Stages</h3>
-        <div class="stage-item">Download Framework</div>
-        <div class="stage-item">Clone Repository</div>
-        <div class="stage-item">Detect Language (${env.LANGUAGE})</div>
-        <div class="stage-item">Build (${env.BUILD_TOOL})</div>
-        <div class="stage-item">Unit Tests</div>
-        <div class="stage-item">Secret Scan (Gitleaks)</div>
-        <div class="stage-item">SAST Analysis</div>
-        <div class="stage-item">SCA Analysis</div>
+        <div class="stage-item">✅ Download Framework</div>
+        <div class="stage-item">✅ Clone Repository</div>
+        <div class="stage-item">✅ Detect Language (${env.LANGUAGE})</div>
+        <div class="stage-item">✅ Build (${env.BUILD_TOOL})</div>
+        <div class="stage-item">✅ Unit Tests</div>
+        <div class="stage-item">${stageIcon(secretsStatus)} Secret Scan (${secretsStatus})</div>
+        <div class="stage-item">${stageIcon(sastStatus)} SAST Analysis (${sastStatus})</div>
+        <div class="stage-item">${stageIcon(scaStatus)} SCA Analysis (${scaStatus})</div>
+        <div class="stage-item">${stageIcon(containerStatus)} Container Scan (${containerStatus})</div>
     </div>
     
     <div style="margin-top: 30px; padding: 20px; background: #0f3460; border-radius: 10px;">
