@@ -1,0 +1,75 @@
+# .devsecops.yml — Project-level DevSecOps configuration
+# Place this file at the root of your repository to override framework defaults.
+# All keys are optional; omitted keys fall back to framework defaults.
+
+version: "1.0"
+
+# ── Language Override ──────────────────────────────────────────
+# Uncomment to force a specific language instead of auto-detection.
+# language:
+#   override: "java"
+#   version: "17"
+
+# ── Build Configuration ───────────────────────────────────────
+build:
+  skip_tests: false
+  # custom_command: "./mvnw clean package -DskipTests -Pproduction"
+  timeout_minutes: 30
+
+# ── Security Configuration ────────────────────────────────────
+security:
+  # Threshold at which the build will be marked unstable.
+  # Options: CRITICAL, HIGH, MEDIUM, LOW, NEVER
+  fail_on: "HIGH"
+
+  # List scan names to skip entirely for this project.
+  skip_scans: []
+    # - "sonarqube"   # e.g. if using external SonarQube analysis
+    # - "gitleaks"    # e.g. if repo has encrypted secrets by design
+
+  sonarqube:
+    # project_key: "my-custom-key"
+    quality_gate_wait: false
+    exclusions: "**/target/**,**/build/**,**/node_modules/**"
+
+  semgrep:
+    config: "auto"   # or "p/ci", "p/security-audit", path to local rules
+
+  trivy:
+    severity: "HIGH,CRITICAL"
+    ignore_unfixed: false
+
+# ── Deployment ────────────────────────────────────────────────
+deployment:
+  staging:
+    url: "https://staging.example.com"
+    health_check: "/actuator/health"
+    timeout_seconds: 60
+
+  production:
+    url: "https://prod.example.com"
+    requires_approval: true
+    approvers:
+      - admin
+      - release-manager
+
+# ── Notifications ─────────────────────────────────────────────
+notifications:
+  slack:
+    channel: "#security-alerts"
+    # webhook_url: "https://hooks.slack.com/services/..."
+    on_success: false
+    on_failure: true
+    on_approval: true
+
+  email:
+    recipients:
+      - team@example.com
+      - security@example.com
+    on_success: true
+    on_failure: true
+
+# ── Performance ───────────────────────────────────────────────
+performance:
+  max_parallel_scans: 3
+  container_build_timeout: 600   # seconds

@@ -1,0 +1,380 @@
+pipeline {
+    agent {
+        docker { 
+            image 'jenkins/agent:latest'
+            args '-v /var/run/docker.sock:/var/run/docker.sock'
+        }
+    }
+    
+    environment {
+        REPORT_DIR         = "${WORKSPACE}/reports"
+        SECURITY_THRESHOLD = 'HIGH' // default; overridden by .devsecops.yml
+    }
+    
+    options {
+        timeout(time: 60, unit: 'MINUTES')
+        disableConcurrentBuilds()
+    }
+
+    stages {
+        // ───────────────────── Stage 1: Initialize ─────────────────────
+        stage('Initialize') {
+            steps {
+                script {
+                    sh 'mkdir -p ${REPORT_DIR}'
+                    
+                    // Load Language Detector
+                    if (fileExists('detect-language.sh')) {
+                        sh 'chmod +x detect-language.sh'
+                        def detection = sh(script: './detect-language.sh', returnStdout: true).trim()
+                        detection.eachLine { line ->
+                            if (line.contains('=')) {
+                                def (key, value) = line.split('=', 2)
+                                env."${key}" = value
+                            }
+                        }
+                    } else {
+                        error "detect-language.sh not found!"
+                    }
+                    
+                    // Load all adapters
+                    buildAdapter        = load "${WORKSPACE}/src/com/devsecops/BuildAdapter.groovy"
+                    securityScanner     = load "${WORKSPACE}/src/com/devsecops/SecurityScanner.groovy"
+                    configLoader        = load "${WORKSPACE}/src/com/devsecops/ConfigLoader.groovy"
+                    notificationManager = load "${WORKSPACE}/src/com/devsecops/NotificationManager.groovy"
+                    trendAnalyzer       = load "${WORKSPACE}/src/com/devsecops/TrendAnalyzer.groovy"
+
+                    // Load project configuration (.devsecops.yml)
+                    pipelineConfig = configLoader.loadConfig(env.WORKSPACE)
+                    env.SECURITY_THRESHOLD = configLoader.getSecurityThreshold(pipelineConfig)
+
+                    // Apply language override from config if set
+                    def langOverride = configLoader.getLanguageOverride(pipelineConfig)
+                    if (langOverride) {
+                        echo "⚙️ Language overridden by .devsecops.yml: ${langOverride}"
+                        env.LANGUAGE = langOverride
+                    }
+
+                    echo "✅ Initialized: Language=${env.LANGUAGE}, Tool=${env.BUILD_TOOL}, Threshold=${env.SECURITY_THRESHOLD}"
+                }
+            }
+        }
+
+        // ───────────────────── Stage 2: Build ──────────────────────────
+        stage('Build') {
+            when { expression { env.LANGUAGE != 'unknown' } }
+            steps {
+                script {
+                    // Use custom build command from config if provided
+                    def customCmd = configLoader.getCustomBuildCommand(pipelineConfig)
+                    def result
+                    if (customCmd) {
+                        echo "⚙️ Using custom build command from .devsecops.yml"
+                        sh customCmd
+                        result = [success: true, artifactPath: buildAdapter.getArtifactPath(env.LANGUAGE, env.PACKAGE_TYPE), errorMessage: '']
+                    } else {
+                        result = buildAdapter.buildProject(env.LANGUAGE, env.BUILD_TOOL)
+                    }
+                    if (!result.success) {
+                        error "Build failed: ${result.errorMessage}"
+                    }
+                    env.ARTIFACT_PATH = result.artifactPath
+                    echo "✅ Build successful. Artifacts: ${env.ARTIFACT_PATH}"
+                }
+            }
+        }
+
+        // ───────────────────── Stage 3: Test ───────────────────────────
+        stage('Test') {
+            when {
+                expression {
+                    env.LANGUAGE != 'unknown' && !configLoader.shouldSkipTests(pipelineConfig)
+                }
+            }
+            steps {
+                script {
+                    def result = buildAdapter.testProject(env.LANGUAGE, env.BUILD_TOOL)
+                    if (!result.success) {
+                        error "Tests failed"
+                    }
+                }
+            }
+        }
+
+        // ───────────────────── Stage 4: Security (Parallel) ────────────
+        stage('Security Scans') {
+            when { expression { env.LANGUAGE != 'unknown' } }
+            parallel {
+                stage('Secret Scan') {
+                    steps {
+                        script {
+                            env.SECRET_RESULT = securityScanner.runSecretScan(env.REPORT_DIR)
+                        }
+                    }
+                }
+                stage('SAST') {
+                    steps {
+                        script {
+                            env.SAST_RESULT = securityScanner.runSAST(env.LANGUAGE, env.REPORT_DIR)
+                        }
+                    }
+                }
+                stage('SCA') {
+                    steps {
+                        script {
+                            env.SCA_RESULT = securityScanner.runSCA(env.LANGUAGE, env.REPORT_DIR)
+                        }
+                    }
+                }
+            }
+        }
+
+        // ───────────────────── Stage 5: Container Build & Scan ─────────
+        stage('Container Security') {
+            when {
+                expression {
+                    env.PACKAGE_TYPE == 'docker' || fileExists('Dockerfile')
+                }
+            }
+            steps {
+                script {
+                    def imageName = "${env.JOB_NAME}:${env.BUILD_NUMBER}".toLowerCase()
+
+                    sh "docker build -t ${imageName} ."
+
+                    def result = securityScanner.runContainerScan(imageName, env.REPORT_DIR)
+                    echo "Container vulnerabilities: ${result.vulnerabilities.total}"
+
+                    if (securityScanner.shouldFailBuild("${env.REPORT_DIR}/trivy-container.json", env.SECURITY_THRESHOLD)) {
+                        unstable "Container scan found vulnerabilities at or above ${env.SECURITY_THRESHOLD}"
+                    }
+                }
+            }
+        }
+
+        // ───────────────────── Stage 6: Security Gate ──────────────────
+        stage('Security Gate') {
+            when { expression { env.LANGUAGE != 'unknown' } }
+            steps {
+                script {
+                    def failBuild = false
+
+                    // Check all Semgrep / SAST reports
+                    def reportFiles = findFiles(glob: "${env.REPORT_DIR}/semgrep-*.json")
+                    reportFiles.each { f ->
+                        if (securityScanner.shouldFailBuild(f.path, env.SECURITY_THRESHOLD)) {
+                            echo "🚨 SAST report ${f.name} has findings >= ${env.SECURITY_THRESHOLD}"
+                            failBuild = true
+                        }
+                    }
+
+                    // Check Gitleaks
+                    if (securityScanner.shouldFailBuild("${env.REPORT_DIR}/gitleaks.json", env.SECURITY_THRESHOLD)) {
+                        echo "🚨 Secrets detected!"
+                        failBuild = true
+                    }
+
+                    if (failBuild) {
+                        unstable "Security findings meet or exceed threshold: ${env.SECURITY_THRESHOLD}"
+                    } else {
+                        echo "✅ Security gate passed"
+                    }
+                }
+            }
+        }
+
+        // ───────────────────── Stage 7: Approval Gate ──────────────────
+        stage('Approval') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    def approvers = configLoader.getApprovers(pipelineConfig)
+
+                    // Send notification before waiting
+                    notificationManager.notifyApprovalRequested(
+                        'Deploy to Production',
+                        approvers,
+                        pipelineConfig
+                    )
+
+                    timeout(time: 24, unit: 'HOURS') {
+                        def approval = input(
+                            message: 'Deploy to production?',
+                            ok: 'Approve',
+                            submitter: approvers,
+                            submitterParameter: 'APPROVER',
+                            parameters: [
+                                string(name: 'APPROVER_NOTES', defaultValue: '', description: 'Optional notes')
+                            ]
+                        )
+                        echo "✅ Approved by: ${approval.APPROVER} — Notes: ${approval.APPROVER_NOTES}"
+                    }
+                }
+            }
+        }
+
+        // ───────────────────── Stage 8: Trend Analysis ──────────────────
+        stage('Trend Analysis') {
+            steps {
+                script {
+                    def currentMetrics  = trendAnalyzer.collectMetrics(env.REPORT_DIR)
+                    trendAnalyzer.saveMetrics(currentMetrics, env.REPORT_DIR)
+                    def previousMetrics = trendAnalyzer.loadPreviousMetrics()
+                    env.TREND_DATA      = groovy.json.JsonOutput.toJson(
+                        trendAnalyzer.computeTrend(currentMetrics, previousMetrics)
+                    )
+                }
+            }
+        }
+
+        // ───────────────────── Stage 9: Unified Report ─────────────────
+        stage('Generate Report') {
+            steps {
+                script {
+                    def trend = readJSON text: env.TREND_DATA, returnPojo: true
+                    generateUnifiedReport(trend)
+                }
+                publishHTML(target: [
+                    allowMissing: true,
+                    alwaysLinkToLastBuild: true,
+                    keepAll: true,
+                    reportDir: env.REPORT_DIR,
+                    reportFiles: 'unified-report.html',
+                    reportName: 'DevSecOps Report'
+                ])
+            }
+        }
+    }
+    
+    post {
+        always {
+            archiveArtifacts artifacts: 'reports/**/*', allowEmptyArchive: true
+        }
+        failure {
+            script {
+                notificationManager.notifyBuildStatus('FAILURE',
+                    "Build #${env.BUILD_NUMBER} failed for ${env.JOB_NAME}",
+                    pipelineConfig ?: [:])
+            }
+        }
+        unstable {
+            script {
+                notificationManager.notifyBuildStatus('UNSTABLE',
+                    "Security findings detected in ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                    pipelineConfig ?: [:])
+            }
+        }
+        success {
+            script {
+                notificationManager.notifyBuildStatus('SUCCESS',
+                    "All checks passed for ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                    pipelineConfig ?: [:])
+            }
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Report Generator (inline function)
+// ──────────────────────────────────────────────────────────────────────
+def generateUnifiedReport(Map trend = [:]) {
+    echo "📝 Generating unified HTML report..."
+
+    // Gather metrics from JSON reports
+    def semgrepFindings = 0
+    def scaVulns        = 0
+    def secretsFound    = 0
+    def containerVulns  = 0
+
+    // Semgrep
+    def semgrepFiles = findFiles(glob: "${env.REPORT_DIR}/semgrep-*.json")
+    semgrepFiles.each { f ->
+        try {
+            def r = readJSON file: f.path, returnPojo: true
+            semgrepFindings += r.results?.size() ?: 0
+        } catch (Exception ignored) {}
+    }
+
+    // Gitleaks
+    if (fileExists("${env.REPORT_DIR}/gitleaks.json")) {
+        try {
+            def r = readJSON file: "${env.REPORT_DIR}/gitleaks.json", returnPojo: true
+            secretsFound = (r instanceof List) ? r.size() : 0
+        } catch (Exception ignored) {}
+    }
+
+    // Trivy
+    if (fileExists("${env.REPORT_DIR}/trivy-container.json")) {
+        try {
+            def r = readJSON file: "${env.REPORT_DIR}/trivy-container.json", returnPojo: true
+            containerVulns = r.Results?.collect { it.Vulnerabilities?.size() ?: 0 }?.sum() ?: 0
+        } catch (Exception ignored) {}
+    }
+
+    // Overall status colour
+    def overallStatus = 'GREEN'
+    def statusEmoji   = '✅'
+    if (semgrepFindings > 0 || scaVulns > 0) { overallStatus = 'YELLOW'; statusEmoji = '⚠️' }
+    if (secretsFound > 0 || containerVulns > 5)  { overallStatus = 'RED';    statusEmoji = '🚨' }
+
+    def html = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>DevSecOps Unified Report</title>
+<style>
+  :root{--bg:#0f172a;--card:#1e293b;--border:#334155;--text:#e2e8f0;--accent:#38bdf8;--green:#22c55e;--yellow:#eab308;--red:#ef4444}
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);padding:2rem}
+  h1{font-size:1.8rem;margin-bottom:.5rem}
+  .subtitle{color:#94a3b8;margin-bottom:2rem}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:1rem;margin-bottom:2rem}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:.75rem;padding:1.25rem}
+  .card h3{font-size:.85rem;text-transform:uppercase;letter-spacing:.05em;color:#94a3b8;margin-bottom:.5rem}
+  .card .value{font-size:2rem;font-weight:700}
+  .status-GREEN .value{color:var(--green)}
+  .status-YELLOW .value{color:var(--yellow)}
+  .status-RED .value{color:var(--red)}
+  table{width:100%;border-collapse:collapse;margin-top:1rem}
+  th,td{text-align:left;padding:.6rem 1rem;border-bottom:1px solid var(--border)}
+  th{color:#94a3b8;font-size:.8rem;text-transform:uppercase}
+  .badge{display:inline-block;padding:.15rem .5rem;border-radius:9999px;font-size:.75rem;font-weight:600}
+  .badge-green{background:#16a34a22;color:var(--green)}
+  .badge-yellow{background:#ca8a0422;color:var(--yellow)}
+  .badge-red{background:#dc262622;color:var(--red)}
+  footer{margin-top:2rem;color:#475569;font-size:.8rem;text-align:center}
+</style>
+</head>
+<body>
+<h1>${statusEmoji} DevSecOps Pipeline Report</h1>
+<p class="subtitle">Build #\${env.BUILD_NUMBER ?: 'N/A'} &bull; \${new Date().format('yyyy-MM-dd HH:mm:ss')}</p>
+
+<div class="grid">
+  <div class="card status-${overallStatus}"><h3>Overall Status</h3><div class="value">${overallStatus}</div></div>
+  <div class="card"><h3>Language</h3><div class="value">\${env.LANGUAGE ?: 'N/A'}</div></div>
+  <div class="card"><h3>Build Tool</h3><div class="value">\${env.BUILD_TOOL ?: 'N/A'}</div></div>
+  <div class="card"><h3>Threshold</h3><div class="value">\${env.SECURITY_THRESHOLD ?: 'HIGH'}</div></div>
+</div>
+
+<div class="card" style="margin-bottom:1.5rem">
+<h3>Security Summary</h3>
+<table>
+  <tr><th>Category</th><th>Tool</th><th>Findings</th><th>Status</th></tr>
+  <tr><td>SAST</td><td>Semgrep</td><td>${semgrepFindings}</td><td><span class="badge ${semgrepFindings > 0 ? 'badge-yellow' : 'badge-green'}">${semgrepFindings > 0 ? 'FINDINGS' : 'CLEAN'}</span></td></tr>
+  <tr><td>Secrets</td><td>Gitleaks</td><td>${secretsFound}</td><td><span class="badge ${secretsFound > 0 ? 'badge-red' : 'badge-green'}">${secretsFound > 0 ? 'DETECTED' : 'CLEAN'}</span></td></tr>
+  <tr><td>Container</td><td>Trivy</td><td>${containerVulns}</td><td><span class="badge ${containerVulns > 0 ? 'badge-yellow' : 'badge-green'}">${containerVulns > 0 ? 'VULNERABILITIES' : 'CLEAN'}</span></td></tr>
+</table>
+</div>
+
+${trendAnalyzer.trendHtml(trend)}
+
+<footer>Generated by Universal DevSecOps Framework &bull; \${new Date().format('yyyy-MM-dd HH:mm:ss z')}</footer>
+</body>
+</html>"""
+
+    writeFile file: "${env.REPORT_DIR}/unified-report.html", text: html
+    echo "✅ Report written to ${env.REPORT_DIR}/unified-report.html"
+}
