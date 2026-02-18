@@ -211,7 +211,7 @@ DETECTEOF
                             switch(env.BUILD_TOOL) {
                                 case 'maven':
                                     sh './mvnw test 2>/dev/null || mvn test || echo "Tests skipped"'
-                                    junit '**/target/surefire-reports/*.xml', allowEmptyResults: true
+                                    junit testResults: '**/target/surefire-reports/*.xml', allowEmptyResults: true
                                     break
                                 case 'gradle':
                                     sh './gradlew test 2>/dev/null || gradle test || echo "Tests skipped"'
