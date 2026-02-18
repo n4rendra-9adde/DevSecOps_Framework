@@ -113,42 +113,39 @@ DETECTEOF
 
         stage('Build') {
             steps {
-                catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
-                    script {
-                        dir("${env.WORK_DIR}") {
-                            echo "🔨 Building ${env.LANGUAGE} with ${env.BUILD_TOOL}"
+                script {
+                    dir("${env.WORK_DIR}") {
+                        echo "🔨 Building ${env.LANGUAGE} with ${env.BUILD_TOOL}"
 
-                            switch(env.BUILD_TOOL) {
-                                case 'maven':
-                                    sh './mvnw clean package -DskipTests 2>/dev/null || mvn clean package -DskipTests'
-                                    break
-                                case 'gradle':
-                                    sh './gradlew build -x test 2>/dev/null || gradle build -x test'
-                                    break
-                                case 'npm':
-                                    sh 'npm ci && (npm run build 2>/dev/null || echo "No build script")'
-                                    break
-                                case 'pip':
-                                    sh '''
-                                        if python3 -m venv venv 2>/dev/null; then
-                                            . venv/bin/activate
-                                            pip install -r requirements.txt
-                                        else
-                                            pip install -r requirements.txt --break-system-packages 2>/dev/null || \
-                                            pip3 install -r requirements.txt --break-system-packages || \
-                                            echo "⚠️ pip install failed, continuing"
-                                        fi
-                                    '''
-                                    break
-                                case 'go':
-                                    sh 'go build -o app . || echo "Go build failed"'
-                                    break
-                                case 'cargo':
-                                    sh 'cargo build --release || echo "Cargo build failed"'
-                                    break
-                                default:
-                                    echo "⚠️ Unknown build tool: ${env.BUILD_TOOL}"
-                            }
+                        switch(env.BUILD_TOOL) {
+                            case 'maven':
+                                sh './mvnw clean package -DskipTests 2>/dev/null || mvn clean package -DskipTests'
+                                break
+                            case 'gradle':
+                                sh './gradlew build -x test 2>/dev/null || gradle build -x test'
+                                break
+                            case 'npm':
+                                sh 'npm ci && (npm run build 2>/dev/null || echo "No build script")'
+                                break
+                            case 'pip':
+                                sh '''
+                                    if python3 -m venv venv 2>/dev/null; then
+                                        . venv/bin/activate
+                                        pip install -r requirements.txt
+                                    else
+                                        pip install -r requirements.txt --break-system-packages 2>/dev/null || \
+                                        pip3 install -r requirements.txt --break-system-packages
+                                    fi
+                                '''
+                                break
+                            case 'go':
+                                sh 'go build -o app .'
+                                break
+                            case 'cargo':
+                                sh 'cargo build --release'
+                                break
+                            default:
+                                error "❌ Unknown build tool: ${env.BUILD_TOOL}"
                         }
                     }
                 }
