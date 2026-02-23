@@ -98,7 +98,7 @@ fi
 
 # ── Source extensions (40 pts) — quick scan ──
 find . -maxdepth 2 -name "*.java" -print -quit 2>/dev/null | grep -q . && scores[java]=$((${scores[java]:-0}+40))
-find . -maxdepth 2 \( -name "*.js" -o -name "*.ts" \) -not -path "*/node_modules/*" -print -quit 2>/dev/null | grep -q . && scores[nodejs]=$((${scores[nodejs]:-0}+40))
+find . -maxdepth 2 \\( -name "*.js" -o -name "*.ts" \\) -not -path "*/node_modules/*" -print -quit 2>/dev/null | grep -q . && scores[nodejs]=$((${scores[nodejs]:-0}+40))
 find . -maxdepth 2 -name "*.py" -print -quit 2>/dev/null | grep -q . && scores[python]=$((${scores[python]:-0}+40))
 find . -maxdepth 2 -name "*.go" -print -quit 2>/dev/null | grep -q . && scores[golang]=$((${scores[golang]:-0}+40))
 find . -maxdepth 2 -name "*.rs" -print -quit 2>/dev/null | grep -q . && scores[rust]=$((${scores[rust]:-0}+40))
