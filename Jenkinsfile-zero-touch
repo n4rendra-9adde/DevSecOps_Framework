@@ -96,12 +96,12 @@ fi
 [ -f "go.mod" ]    && { scores[golang]=$((${scores[golang]:-0}+70)); tools[golang]=${tools[golang]:-go}; packages[golang]=binary; }
 [ -f "Cargo.toml" ] && { scores[rust]=$((${scores[rust]:-0}+70)); tools[rust]=${tools[rust]:-cargo}; packages[rust]=binary; }
 
-# ── Source extensions (40 pts) — quick scan ──
-find . -maxdepth 2 -name "*.java" -print -quit 2>/dev/null | grep -q . && scores[java]=$((${scores[java]:-0}+40))
-find . -maxdepth 2 \\( -name "*.js" -o -name "*.ts" \\) -not -path "*/node_modules/*" -print -quit 2>/dev/null | grep -q . && scores[nodejs]=$((${scores[nodejs]:-0}+40))
-find . -maxdepth 2 -name "*.py" -print -quit 2>/dev/null | grep -q . && scores[python]=$((${scores[python]:-0}+40))
-find . -maxdepth 2 -name "*.go" -print -quit 2>/dev/null | grep -q . && scores[golang]=$((${scores[golang]:-0}+40))
-find . -maxdepth 2 -name "*.rs" -print -quit 2>/dev/null | grep -q . && scores[rust]=$((${scores[rust]:-0}+40))
+# ── Source extensions (40 pts) — quick scan, also set tool defaults ──
+find . -maxdepth 2 -name "*.java" -print -quit 2>/dev/null | grep -q . && { scores[java]=$((${scores[java]:-0}+40)); tools[java]=${tools[java]:-maven}; packages[java]=${packages[java]:-jar}; }
+find . -maxdepth 2 \\( -name "*.js" -o -name "*.ts" \\) -not -path "*/node_modules/*" -print -quit 2>/dev/null | grep -q . && { scores[nodejs]=$((${scores[nodejs]:-0}+40)); tools[nodejs]=${tools[nodejs]:-npm}; packages[nodejs]=${packages[nodejs]:-docker}; }
+find . -maxdepth 2 -name "*.py" -print -quit 2>/dev/null | grep -q . && { scores[python]=$((${scores[python]:-0}+40)); tools[python]=${tools[python]:-pip}; packages[python]=${packages[python]:-docker}; }
+find . -maxdepth 2 -name "*.go" -print -quit 2>/dev/null | grep -q . && { scores[golang]=$((${scores[golang]:-0}+40)); tools[golang]=${tools[golang]:-go}; packages[golang]=${packages[golang]:-binary}; }
+find . -maxdepth 2 -name "*.rs" -print -quit 2>/dev/null | grep -q . && { scores[rust]=$((${scores[rust]:-0}+40)); tools[rust]=${tools[rust]:-cargo}; packages[rust]=${packages[rust]:-binary}; }
 
 # ── Docker-only fallback ──
 if [ ${#scores[@]} -eq 0 ]; then
@@ -159,6 +159,19 @@ DETECTEOF
                         env.LANGUAGE     = env.PRIMARY_LANGUAGE
                         env.BUILD_TOOL   = env.PRIMARY_BUILD_TOOL
                         env.PACKAGE_TYPE = env.PRIMARY_PACKAGE_TYPE
+
+                        // Fallback: map language → default build tool if detection missed it
+                        if (!env.BUILD_TOOL || env.BUILD_TOOL.trim() == '') {
+                            def toolDefaults = [python:'pip', nodejs:'npm', java:'maven', golang:'go', rust:'cargo', docker:'docker']
+                            env.BUILD_TOOL = toolDefaults[env.LANGUAGE] ?: 'unknown'
+                            env.PRIMARY_BUILD_TOOL = env.BUILD_TOOL
+                            echo "⚠️ BUILD_TOOL was empty, defaulted to '${env.BUILD_TOOL}' for ${env.LANGUAGE}"
+                        }
+                        if (!env.PACKAGE_TYPE || env.PACKAGE_TYPE.trim() == '') {
+                            def pkgDefaults = [python:'docker', nodejs:'docker', java:'jar', golang:'binary', rust:'binary', docker:'docker']
+                            env.PACKAGE_TYPE = pkgDefaults[env.LANGUAGE] ?: 'unknown'
+                            env.PRIMARY_PACKAGE_TYPE = env.PACKAGE_TYPE
+                        }
 
                         // Confidence threshold — below 60 forces Docker hermetic builds
                         if (env.PRIMARY_CONFIDENCE && env.PRIMARY_CONFIDENCE.toInteger() < 60) {
